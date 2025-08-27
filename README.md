@@ -1,6 +1,7 @@
 # nocb
 
 nearly optimal clipboard manager - fast, compressed, hash-based storage
+<img width="804" height="561" alt="image" src="https://github.com/user-attachments/assets/4562f64d-cf15-4153-8248-3d42720048a7" />
 
 ## features
 
