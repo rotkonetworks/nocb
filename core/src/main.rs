@@ -19,6 +19,14 @@ enum Commands {
     Daemon,
     /// Print clipboard history for rofi
     Print,
+    /// Search clipboard history with full content
+    Search {
+        /// Search query pattern (optional - if not provided, shows all entries)
+        query: Option<String>,
+        /// Output full content instead of truncated previews
+        #[arg(long)]
+        full: bool,
+    },
     /// Copy selection to clipboard (reads from stdin if no args)
     Copy {
         /// Selection text or image reference to copy
@@ -74,6 +82,10 @@ async fn main() -> Result<()> {
         Commands::Print => {
             let manager = ClipboardManager::new(config).await?;
             manager.print_history()?;
+        }
+        Commands::Search { query, full } => {
+            let manager = ClipboardManager::new(config).await?;
+            manager.search_entries(query.as_deref(), full)?;
         }
         Commands::Copy { selection } => {
             let selection = if selection.is_empty() {

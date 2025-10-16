@@ -464,6 +464,7 @@ impl ClipboardManager {
 
     async fn poll_clipboard(&mut self) -> Result<()> {
         let content = {
+            // Try non-blocking first, then fall back to brief blocking attempt
             match self.clipboard.try_write() {
                 Some(mut clipboard) => {
                     if let Ok(text) = clipboard.get_text() {
@@ -474,7 +475,11 @@ impl ClipboardManager {
                         None
                     }
                 }
-                None => return Ok(()),
+                None => {
+                    // Clipboard is locked by copy operation - skip this poll cycle
+                    // This prevents race conditions during copy operations
+                    return Ok(());
+                },
             }
         };
 
@@ -762,27 +767,53 @@ impl ClipboardManager {
     }
 
     fn delete_entry(&mut self, hash: &str) -> Result<()> {
-        let file_path: Option<String> = self
-            .db
-            .query_row(
-                "SELECT file_path FROM entries WHERE hash = ?1",
-                params![hash],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        self.db
-            .execute("DELETE FROM entries WHERE hash = ?1", params![hash])?;
-
-        self.cache.remove(hash);
-
-        if let Some(file_path) = file_path {
-            let path = self.config.cache_dir.join("blobs").join(file_path);
-            let _ = fs::remove_file(path);
+        // Handle both full hashes and prefixes
+        let entries_to_delete: Vec<(String, Option<String>)> = if hash.len() == 64 {
+            // Full hash provided
+            let file_path: Option<String> = self
+                .db
+                .query_row(
+                    "SELECT file_path FROM entries WHERE hash = ?1",
+                    params![hash],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if file_path.is_some() || self.db.query_row("SELECT 1 FROM entries WHERE hash = ?1", params![hash], |_| Ok(())).optional()?.is_some() {
+                vec![(hash.to_string(), file_path)]
+            } else {
+                vec![]
+            }
         } else {
-            // backward compatibility
-            let path = self.config.cache_dir.join("blobs").join(hash);
-            let _ = fs::remove_file(path);
+            // Hash prefix provided - find all matching entries
+            let mut stmt = self.db.prepare(
+                "SELECT hash, file_path FROM entries WHERE hash LIKE ?1 || '%'"
+            )?;
+            stmt.query_map(params![hash], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+
+        // Delete all matching entries
+        for (full_hash, file_path) in entries_to_delete {
+            self.db
+                .execute("DELETE FROM entries WHERE hash = ?1", params![full_hash])?;
+
+            self.cache.remove(&full_hash);
+
+            // Remove associated files
+            if let Some(file_path) = file_path {
+                let path = self.config.cache_dir.join("blobs").join(&file_path);
+                let _ = fs::remove_file(&path);
+            }
+
+            // Also try to remove legacy file paths (backward compatibility)
+            let legacy_path = self.config.cache_dir.join("blobs").join(&full_hash);
+            let _ = fs::remove_file(&legacy_path);
+            let txt_path = self.config.cache_dir.join("blobs").join(format!("{}.txt", full_hash));
+            let _ = fs::remove_file(&txt_path);
+            let zst_path = self.config.cache_dir.join("blobs").join(format!("{}.txt.zst", full_hash));
+            let _ = fs::remove_file(&zst_path);
         }
 
         Ok(())
@@ -1093,14 +1124,34 @@ impl ClipboardManager {
         }
 
         // copy as literal text
-        let mut clipboard = self.clipboard.write();
-        clipboard.set_text(selection.to_string())?;
+        {
+            let mut clipboard = self.clipboard.write();
+            clipboard.set_text(selection.to_string())?;
+        } // Release clipboard lock immediately
         Ok(())
     }
 
     async fn copy_by_hash(&self, hash_prefix: &str) -> Result<()> {
+        // Require minimum 8 characters to avoid collisions
+        if hash_prefix.len() < 8 {
+            anyhow::bail!("Hash prefix too short - minimum 8 characters required");
+        }
+
+        let mut matches = Vec::new();
+
         // cache lookup first for performance
         for (full_hash, cached) in self.cache.iter_sorted() {
+            if full_hash.starts_with(hash_prefix) {
+                matches.push((full_hash.clone(), cached.clone()));
+            }
+        }
+
+        // If multiple matches found, require more specificity
+        if matches.len() > 1 {
+            anyhow::bail!("Ambiguous hash prefix '{}' - {} matches found. Use more characters.", hash_prefix, matches.len());
+        }
+
+        if let Some((full_hash, cached)) = matches.first() {
             if full_hash.starts_with(hash_prefix) {
                 return match cached.content_type.as_str() {
                     "text" => {
@@ -1126,8 +1177,10 @@ impl ClipboardManager {
                                 fs::read_to_string(path)?
                             };
 
-                            let mut clipboard = self.clipboard.write();
-                            clipboard.set_text(text.clone())?;
+                            {
+                                let mut clipboard = self.clipboard.write();
+                                clipboard.set_text(text.clone())?;
+                            }
                             text.zeroize();
                             Ok(())
                         } else {
@@ -1149,8 +1202,10 @@ impl ClipboardManager {
                                 bytes: rgba.into_raw().into(),
                             };
 
-                            let mut clipboard = self.clipboard.write();
-                            clipboard.set_image(img_data)?;
+                            {
+                                let mut clipboard = self.clipboard.write();
+                                clipboard.set_image(img_data)?;
+                            }
                             Ok(())
                         } else {
                             anyhow::bail!("Missing image path")
@@ -1161,31 +1216,38 @@ impl ClipboardManager {
             }
         }
 
-        // cache miss, query database
-        let row: Option<(String, Option<String>, Option<String>, Option<bool>)> = self
-            .db
-            .query_row(
-                "SELECT content_type, inline_text, file_path, compressed 
-             FROM entries WHERE hash LIKE ?1 || '%' 
-             ORDER BY timestamp DESC LIMIT 1",
-                params![hash_prefix],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get::<_, Option<i64>>(3)?.map(|v| v != 0),
-                    ))
-                },
-            )
-            .optional()?;
+        // cache miss, query database - check for ambiguous matches
+        let mut stmt = self.db.prepare(
+            "SELECT hash, content_type, inline_text, file_path, compressed
+             FROM entries WHERE hash LIKE ?1 || '%'
+             ORDER BY timestamp DESC"
+        )?;
 
-        if let Some((content_type, inline_text, file_path, compressed)) = row {
+        let db_matches: Vec<(String, String, Option<String>, Option<String>, Option<bool>)> = stmt
+            .query_map(params![hash_prefix], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get::<_, Option<i64>>(4)?.map(|v| v != 0),
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if db_matches.len() > 1 {
+            anyhow::bail!("Ambiguous hash prefix '{}' - {} matches found in database. Use more characters.", hash_prefix, db_matches.len());
+        }
+
+        if let Some((_full_hash, content_type, inline_text, file_path, compressed)) = db_matches.first() {
+
             match content_type.as_str() {
                 "text" => {
                     if let Some(text) = inline_text {
-                        let mut clipboard = self.clipboard.write();
-                        clipboard.set_text(text)?;
+                        {
+                            let mut clipboard = self.clipboard.write();
+                            clipboard.set_text(text)?;
+                        }
                     }
                 }
                 "text_file" => {
@@ -1202,8 +1264,10 @@ impl ClipboardManager {
                             fs::read_to_string(path)?
                         };
 
-                        let mut clipboard = self.clipboard.write();
-                        clipboard.set_text(text.clone())?;
+                        {
+                            let mut clipboard = self.clipboard.write();
+                            clipboard.set_text(text.clone())?;
+                        }
                         text.zeroize();
                     }
                 }
@@ -1222,8 +1286,10 @@ impl ClipboardManager {
                             bytes: rgba.into_raw().into(),
                         };
 
-                        let mut clipboard = self.clipboard.write();
-                        clipboard.set_image(img_data)?;
+                        {
+                            let mut clipboard = self.clipboard.write();
+                            clipboard.set_image(img_data)?;
+                        }
                     }
                 }
                 _ => anyhow::bail!("Unknown content type"),
@@ -1244,18 +1310,11 @@ impl ClipboardManager {
             let _ = clipboard.set_text("");
         }
 
-        let mut stmt = self.db.prepare("SELECT hash FROM entries")?;
-        let all_hashes: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
-
-        for hash in &all_hashes {
-            self.delete_entry(hash)?;
-        }
-
+        // Bulk delete from database for efficiency
+        self.db.execute("DELETE FROM entries", [])?;
         self.db.execute("VACUUM", [])?;
 
+        // Remove all blob files
         let blobs_dir = self.config.cache_dir.join("blobs");
         if blobs_dir.exists() {
             for entry in fs::read_dir(&blobs_dir)? {
@@ -1373,5 +1432,131 @@ impl ClipboardManager {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(rows)
+    }
+
+    pub fn search_entries(&self, query: Option<&str>, full_content: bool) -> Result<()> {
+        let sql = "SELECT hash, content_type, inline_text, file_path, size_bytes, timestamp, compressed, mime_type, width, height
+                   FROM entries
+                   ORDER BY timestamp DESC";
+
+        let mut stmt = self.db.prepare(sql)?;
+
+        let row_mapper = |row: &rusqlite::Row| -> Result<(String, String, Option<String>, Option<String>, i64, i64, Option<bool>, Option<String>, Option<i64>, Option<i64>), rusqlite::Error> {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<i64>>(6)?.map(|v| v != 0),
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+            ))
+        };
+
+        let rows = stmt.query_map([], row_mapper)?;
+
+        for row in rows {
+            let (hash, content_type, inline_text, file_path, size_bytes, timestamp, compressed, mime_type, width, height) = row?;
+
+            let time_str = self.format_time_ago(timestamp);
+            let size_str = self.format_size(size_bytes);
+            let hash_prefix = &hash[..HASH_PREFIX_LEN.min(hash.len())];
+
+            // Handle query filtering
+            let mut matches_query = query.is_none();
+            if let Some(q) = query {
+                let q_lower = q.to_lowercase();
+
+                // Check inline text
+                if let Some(ref text) = inline_text {
+                    if text.to_lowercase().contains(&q_lower) {
+                        matches_query = true;
+                    }
+                }
+
+                // Check file content for text_file entries
+                if !matches_query && content_type == "text_file" {
+                    if let Some(ref fp) = file_path {
+                        let content = if compressed.unwrap_or(false) {
+                            self.read_compressed_preview(&self.config.cache_dir.join("blobs").join(fp), usize::MAX)
+                        } else {
+                            self.read_plain_preview(&self.config.cache_dir.join("blobs").join(fp), usize::MAX)
+                        };
+
+                        if let Some(content) = content {
+                            if content.to_lowercase().contains(&q_lower) {
+                                matches_query = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !matches_query {
+                continue;
+            }
+
+            match content_type.as_str() {
+                "text" => {
+                    if let Some(text) = inline_text {
+                        if full_content {
+                            println!("HASH:{}|TYPE:text|SIZE:{}|TIME:{}|CONTENT:{}",
+                                hash_prefix, size_str, time_str, text.replace('\n', "\\n"));
+                        } else {
+                            let display = self.truncate_to_fit(&text, 60);
+                            println!("HASH:{}|TYPE:text|SIZE:{}|TIME:{}|CONTENT:{}",
+                                hash_prefix, size_str, time_str, display);
+                        }
+                    }
+                }
+                "text_file" => {
+                    if let Some(fp) = file_path {
+                        let content = if full_content {
+                            // Read full content for search
+                            if compressed.unwrap_or(false) {
+                                self.read_compressed_preview(&self.config.cache_dir.join("blobs").join(&fp), usize::MAX)
+                                    .unwrap_or_else(|| format!("[Text: {}]", size_str))
+                            } else {
+                                self.read_plain_preview(&self.config.cache_dir.join("blobs").join(&fp), usize::MAX)
+                                    .unwrap_or_else(|| format!("[Text: {}]", size_str))
+                            }
+                        } else {
+                            self.read_text_preview(&fp, 60)
+                                .unwrap_or_else(|| format!("[Text: {}]", size_str))
+                        };
+
+                        let display_content = if full_content {
+                            content.replace('\n', "\\n")
+                        } else {
+                            self.truncate_to_fit(&content, 60)
+                        };
+
+                        println!("HASH:{}|TYPE:text_file|SIZE:{}|TIME:{}|CONTENT:{}",
+                            hash_prefix, size_str, time_str, display_content);
+                    }
+                }
+                "image" => {
+                    let mime_short = mime_type
+                        .as_ref()
+                        .map(|m| m.split('/').last().unwrap_or("?"))
+                        .unwrap_or("?");
+
+                    let content = if let (Some(w), Some(h)) = (width, height) {
+                        format!("[IMG:{}x{}px {} {}]", w, h, mime_short, size_str)
+                    } else {
+                        format!("[IMG:{} {}]", mime_short, size_str)
+                    };
+
+                    println!("HASH:{}|TYPE:image|SIZE:{}|TIME:{}|CONTENT:{}",
+                        hash_prefix, size_str, time_str, content);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
     }
 }
