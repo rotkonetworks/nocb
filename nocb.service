@@ -1,13 +1,21 @@
 [Unit]
 Description=NOCB Clipboard Manager
 After=graphical-session.target
+PartOf=graphical-session.target
+After=graphical-session-pre.target
+StartLimitIntervalSec=0
 
 [Service]
-Type=simple
-ExecStart=/home/alice/.local/bin/nocb daemon
-Restart=on-failure
+Type=notify
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/bin/nocb daemon
+Restart=always
 RestartSec=5
 Environment="DISPLAY=:0"
+Environment="XAUTHORITY=%h/.Xauthority"
+WatchdogSec=60
+MemoryMax=256M
+CPUQuota=10%
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
