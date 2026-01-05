@@ -79,7 +79,8 @@ mod daemon {
     }
 
     pub fn get_clips() -> Result<Vec<ClipEntry>, Box<dyn std::error::Error>> {
-        let output = Command::new("nocb").arg("print").output()?;
+        // Use new search API for better data structure
+        let output = Command::new("nocb").arg("search").output()?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut clips = Vec::new();
@@ -89,52 +90,97 @@ mod daemon {
                 continue;
             }
 
-            let parts: Vec<&str> = line.splitn(2, ' ').collect();
-            if parts.len() < 2 {
-                continue;
-            }
-
-            let time_ago = parts[0].to_string();
-            let rest = parts[1];
-
-            let hash_pos = rest.rfind('#').unwrap_or(rest.len());
-            let content = rest[..hash_pos].trim();
-            let hash = if hash_pos < rest.len() {
-                rest[hash_pos + 1..].trim().to_string()
-            } else {
-                format!("unknown{}", id)
-            };
-
-            let (entry_type, size_str, display_content) = if content.starts_with("[IMG:") {
-                (
-                    "image".to_string(),
-                    parse_size_from_image(content),
-                    content.to_string(),
-                )
-            } else if content.contains(" [") && content.ends_with(']') {
-                let bracket_pos = content.rfind(" [").unwrap_or(content.len());
-                let text_part = &content[..bracket_pos];
-                let size_part = &content[bracket_pos + 2..content.len() - 1];
-                (
-                    "text".to_string(),
-                    Some(size_part.to_string()),
-                    text_part.to_string(),
-                )
-            } else {
-                ("text".to_string(), None, content.to_string())
-            };
-
-            clips.push(ClipEntry {
-                id: id as i64,
-                hash: hash.clone(),
-                content: display_content,
-                time_ago,
-                entry_type,
-                size_str,
-            });
+            // Parse structured output: HASH:abc123|TYPE:text|SIZE:1K|TIME:5m|CONTENT:...
+            let entry = parse_structured_entry(line, id)?;
+            clips.push(entry);
         }
 
         Ok(clips)
+    }
+
+    fn parse_structured_entry(line: &str, id: usize) -> Result<ClipEntry, Box<dyn std::error::Error>> {
+        let mut hash = String::new();
+        let mut entry_type = String::new();
+        let mut size_str: Option<String> = None;
+        let mut time_ago = String::new();
+        let mut content = String::new();
+
+        // Split by pipe and parse each field
+        for part in line.split('|') {
+            if let Some(hash_val) = part.strip_prefix("HASH:") {
+                hash = hash_val.to_string();
+            } else if let Some(type_val) = part.strip_prefix("TYPE:") {
+                entry_type = type_val.to_string();
+            } else if let Some(size_val) = part.strip_prefix("SIZE:") {
+                size_str = Some(size_val.to_string());
+            } else if let Some(time_val) = part.strip_prefix("TIME:") {
+                time_ago = time_val.to_string();
+            } else if let Some(content_val) = part.strip_prefix("CONTENT:") {
+                // Restore newlines from escaped format
+                content = content_val.replace("\\n", "\n");
+            }
+        }
+
+        // Fallback to old parsing if structured format not found
+        if hash.is_empty() {
+            return parse_legacy_entry(line, id);
+        }
+
+        Ok(ClipEntry {
+            id: id as i64,
+            hash,
+            content,
+            time_ago,
+            entry_type,
+            size_str,
+        })
+    }
+
+    fn parse_legacy_entry(line: &str, id: usize) -> Result<ClipEntry, Box<dyn std::error::Error>> {
+        // Fallback to old parsing logic for backward compatibility
+        let parts: Vec<&str> = line.splitn(2, ' ').collect();
+        if parts.len() < 2 {
+            return Err("Invalid entry format".into());
+        }
+
+        let time_ago = parts[0].to_string();
+        let rest = parts[1];
+
+        let hash_pos = rest.rfind('#').unwrap_or(rest.len());
+        let content = rest[..hash_pos].trim();
+        let hash = if hash_pos < rest.len() {
+            rest[hash_pos + 1..].trim().to_string()
+        } else {
+            format!("unknown{}", id)
+        };
+
+        let (entry_type, size_str, display_content) = if content.starts_with("[IMG:") {
+            (
+                "image".to_string(),
+                parse_size_from_image(content),
+                content.to_string(),
+            )
+        } else if content.contains(" [") && content.ends_with(']') {
+            let bracket_pos = content.rfind(" [").unwrap_or(content.len());
+            let text_part = &content[..bracket_pos];
+            let size_part = &content[bracket_pos + 2..content.len() - 1];
+            (
+                "text".to_string(),
+                Some(size_part.to_string()),
+                text_part.to_string(),
+            )
+        } else {
+            ("text".to_string(), None, content.to_string())
+        };
+
+        Ok(ClipEntry {
+            id: id as i64,
+            hash,
+            content: display_content,
+            time_ago,
+            entry_type,
+            size_str,
+        })
     }
 
     fn parse_size_from_image(content: &str) -> Option<String> {
@@ -151,6 +197,34 @@ mod daemon {
     pub fn send_command(selection: &str) -> Result<(), Box<dyn std::error::Error>> {
         Command::new("nocb").arg("copy").arg(selection).output()?;
         Ok(())
+    }
+
+    pub fn search_clips(query: &str, full_content: bool) -> Result<Vec<ClipEntry>, Box<dyn std::error::Error>> {
+        let mut cmd = Command::new("nocb");
+        cmd.arg("search");
+
+        if full_content {
+            cmd.arg("--full");
+        }
+
+        if !query.is_empty() {
+            cmd.arg(query);
+        }
+
+        let output = cmd.output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut clips = Vec::new();
+
+        for (id, line) in stdout.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let entry = parse_structured_entry(line, id)?;
+            clips.push(entry);
+        }
+
+        Ok(clips)
     }
 }
 
@@ -308,6 +382,11 @@ impl eframe::App for ClipperGui {
                                     self.model.clips.len()
                                 ),
                             );
+
+                            let search_icon = if self.model.full_search_mode { "🔍" } else { "📝" };
+                            if ui.button(search_icon).on_hover_text("Toggle full-text search").clicked() {
+                                self.process_event(Event::ToggleSearchMode);
+                            }
 
                             if ui.button("⟳").clicked() {
                                 self.process_event(Event::RefreshClips);

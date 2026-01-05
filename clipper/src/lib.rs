@@ -19,6 +19,8 @@ pub struct Model {
     pub search_query: String,
     pub selected_index: usize,
     pub theme: String,
+    pub full_search_mode: bool,
+    pub loading: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -31,6 +33,8 @@ pub enum Event {
     CopyClip(usize),
     Copied,
     KeyPress(Key),
+    ToggleSearchMode,
+    SearchWithQuery(String),
     // Shell request events
     LoadClips,
     CopyToClipboard(String),
@@ -103,6 +107,18 @@ impl App for ClipperApp {
                 Command::done()
             }
             Event::Copied => {
+                caps.render.render();
+                Command::done()
+            }
+            Event::ToggleSearchMode => {
+                model.full_search_mode = !model.full_search_mode;
+                caps.render.render();
+                // Trigger a refresh with the new mode
+                Command::event(Event::RefreshClips)
+            }
+            Event::SearchWithQuery(query) => {
+                model.search_query = query;
+                model.selected_index = 0;
                 caps.render.render();
                 Command::done()
             }
