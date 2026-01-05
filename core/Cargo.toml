@@ -55,6 +55,7 @@ clap = { version = "4.5", features = ["derive"] }
 # Platform-specific dependencies
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+sd-notify = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 # Windows-specific if needed

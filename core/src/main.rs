@@ -27,6 +27,14 @@ enum Commands {
         #[arg(long)]
         full: bool,
     },
+    /// Fast FTS completion search for rofi/fzf (use: nocb complete | fzf | nocb copy)
+    Complete {
+        /// Search query for fuzzy matching
+        query: Option<String>,
+        /// Max results to return
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
     /// Copy selection to clipboard (reads from stdin if no args)
     Copy {
         /// Selection text or image reference to copy
@@ -86,6 +94,10 @@ async fn main() -> Result<()> {
         Commands::Search { query, full } => {
             let manager = ClipboardManager::new(config).await?;
             manager.search_entries(query.as_deref(), full)?;
+        }
+        Commands::Complete { query, limit } => {
+            let manager = ClipboardManager::new(config).await?;
+            manager.complete(query.as_deref().unwrap_or(""), limit)?;
         }
         Commands::Copy { selection } => {
             let selection = if selection.is_empty() {
