@@ -1,0 +1,32 @@
+#!/bin/bash
+# NOCB FZF Search - Enhanced clipboard search with full content
+
+# Usage: nocb-search [query]
+# - If query is provided, searches for that text
+# - If no query, shows all entries for interactive fzf selection
+
+QUERY="$1"
+
+if [ -n "$QUERY" ]; then
+    # Search with query and show results with fzf
+    ./target/release/nocb search --full "$QUERY" | \
+        fzf --delimiter='|' \
+            --with-nth=5.. \
+            --preview='echo {5} | sed "s/CONTENT://" | sed "s/\\\\n/\n/g"' \
+            --preview-window='down:50%:wrap' \
+            --header="Search results for: $QUERY" | \
+        cut -d'|' -f1 | \
+        cut -d':' -f2 | \
+        xargs -I {} ./target/release/nocb copy "#{}"\
+else\
+    # Show all entries for interactive search
+    ./target/release/nocb search --full | \
+        fzf --delimiter='|' \
+            --with-nth=5.. \
+            --preview='echo {5} | sed "s/CONTENT://" | sed "s/\\\\n/\n/g"' \
+            --preview-window='down:50%:wrap' \
+            --header="Search all clipboard history (Ctrl+C to cancel)" | \
+        cut -d'|' -f1 | \
+        cut -d':' -f2 | \
+        xargs -I {} ./target/release/nocb copy "#{}"
+fi
