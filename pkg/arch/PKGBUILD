@@ -1,32 +1,40 @@
-# Maintainer: hitchhooker <your.email@example.com>
+# Maintainer: rotkonetworks <hq@rotko.net>
+# PGP: 813CE099D6CE512BC29A15D841EE1853489958D6
+
 pkgname=nocb
-pkgver=0.2.0
+pkgver=1.1.5
 pkgrel=1
-pkgdesc="X11 clipboard manager with compression and blob storage"
-arch=("x86_64")
-url="https://github.com/hitchhooker/nocb"
-license=("MIT")
-depends=("libx11" "libxcb" "sqlite")
-makedepends=("cargo")
-source=("$pkgname-$pkgver.tar.gz::https://github.com/hitchhooker/nocb/archive/v$pkgver.tar.gz")
-sha256sums=("SKIP")
+pkgdesc="x11 clipboard manager with compression and fts"
+arch=('x86_64')
+url="https://github.com/rotkonetworks/nocb"
+license=('MIT')
+depends=('gcc-libs')
+makedepends=('cargo' 'git')
+install=nocb.install
+source=("git+${url}.git#branch=master")
+sha256sums=('SKIP')
+
+pkgver() {
+	cd "$pkgname"
+	git describe --tags | sed 's/^v//;s/-/./g'
+}
 
 prepare() {
- cd "$pkgname-$pkgver"
- export RUSTUP_TOOLCHAIN=stable
- cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+	cd "$pkgname"
+	export RUSTUP_TOOLCHAIN=stable
+	cargo fetch --locked --target "x86_64-unknown-linux-gnu"
 }
 
 build() {
- cd "$pkgname-$pkgver"
- export RUSTUP_TOOLCHAIN=stable
- export CARGO_TARGET_DIR=target
- cargo build --frozen --release --all-features
+	cd "$pkgname"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	cargo build --frozen --release
 }
 
 package() {
- cd "$pkgname-$pkgver"
- install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
- install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
- install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	cd "$pkgname"
+	install -Dm755 "target/release/nocb" "$pkgdir/usr/bin/nocb"
+	install -Dm644 nocb.service "$pkgdir/usr/lib/systemd/user/nocb.service"
+	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
