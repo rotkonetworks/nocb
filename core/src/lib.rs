@@ -27,6 +27,7 @@ const IPC_MAGIC: &[u8] = b"NOCB\x00\x01";
 const LRU_CACHE_SIZE: usize = 64;
 const CLIPBOARD_TIMEOUT_MS: u64 = 5000; // 5 second timeout for clipboard ops
 const WATCHDOG_INTERVAL_SECS: u64 = 30; // Send watchdog ping every 30s
+const MAX_REINIT_ATTEMPTS: u32 = 5; // Max clipboard reinits before giving up
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -151,6 +152,7 @@ pub struct ClipboardManager {
     command_rx: Option<mpsc::Receiver<Command>>,
     cache: EntryCache,
     clipboard_failures: u32,
+    total_reinit_attempts: u32,
 }
 
 impl ClipboardManager {
@@ -173,11 +175,19 @@ impl ClipboardManager {
             command_rx: None,
             cache,
             clipboard_failures: 0,
+            total_reinit_attempts: 0,
         })
     }
 
     async fn reinitialize_clipboard(&mut self) -> Result<()> {
-        eprintln!("Reinitializing clipboard connection...");
+        self.total_reinit_attempts += 1;
+        eprintln!("Reinitializing clipboard connection (attempt {}/{})...",
+            self.total_reinit_attempts, MAX_REINIT_ATTEMPTS);
+
+        if self.total_reinit_attempts > MAX_REINIT_ATTEMPTS {
+            eprintln!("Too many clipboard reinit attempts, exiting for systemd restart");
+            std::process::exit(1);
+        }
 
         // Drop the old clipboard
         {
@@ -186,7 +196,7 @@ impl ClipboardManager {
         }
 
         // Small delay to let X11/Wayland clean up (async, non-blocking)
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Create new clipboard with timeout to prevent hanging
         let clipboard_result = tokio::time::timeout(
