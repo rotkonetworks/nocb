@@ -1,6 +1,5 @@
 post_install() {
-    echo "==> to enable nocb clipboard daemon for your user:"
-    echo "    systemctl --user daemon-reload"
+    echo "==> run to start nocb now:"
     echo "    systemctl --user enable --now nocb.service"
 }
 

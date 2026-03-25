@@ -1,21 +1,20 @@
 [Unit]
 Description=NOCB Clipboard Manager
 After=graphical-session.target
-PartOf=graphical-session.target
-After=graphical-session-pre.target
 StartLimitIntervalSec=0
 
 [Service]
-Type=notify
-ExecStartPre=/bin/sleep 2
+Type=simple
+ExecStartPre=/bin/sh -c 'until xdpyinfo >/dev/null 2>&1; do sleep 1; done'
 ExecStart=/usr/bin/nocb daemon
 Restart=always
-RestartSec=5
+RestartSec=2
 Environment="DISPLAY=:0"
 Environment="XAUTHORITY=%h/.Xauthority"
-WatchdogSec=60
 MemoryMax=256M
 CPUQuota=10%
+RestartForceExitStatus=1
+SuccessExitStatus=0
 
 [Install]
 WantedBy=graphical-session.target
