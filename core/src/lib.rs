@@ -1,5 +1,7 @@
 mod cache;
+mod service;
 use cache::{CachedEntry, EntryCache};
+use service::{ClipboardRecoveryLayer, ClipboardRouter, Request};
 
 use anyhow::{Context, Result};
 use arboard::{Clipboard, ImageData};
@@ -149,7 +151,6 @@ pub struct ClipboardManager {
     db: SqliteConnection,
     clipboard: Arc<RwLock<Option<Clipboard>>>,
     last_clipboard_hash: Option<String>,
-    command_rx: Option<mpsc::Receiver<Command>>,
     cache: EntryCache,
     clipboard_failures: u32,
     total_reinit_attempts: u32,
@@ -172,7 +173,6 @@ impl ClipboardManager {
             db,
             clipboard: Arc::new(RwLock::new(Some(clipboard))),
             last_clipboard_hash: None,
-            command_rx: None,
             cache,
             clipboard_failures: 0,
             total_reinit_attempts: 0,
@@ -186,7 +186,7 @@ impl ClipboardManager {
 
         if self.total_reinit_attempts > MAX_REINIT_ATTEMPTS {
             eprintln!("Too many clipboard reinit attempts, exiting for systemd restart");
-            std::process::exit(1);
+            anyhow::bail!("Clipboard unrecoverable after {} reinit attempts", MAX_REINIT_ATTEMPTS);
         }
 
         // Drop the old clipboard
@@ -209,6 +209,7 @@ impl ClipboardManager {
                 let mut clipboard_guard = self.clipboard.write();
                 *clipboard_guard = Some(new_clipboard);
                 self.clipboard_failures = 0;
+                self.total_reinit_attempts = 0;
                 eprintln!("Clipboard reinitialized successfully");
                 Ok(())
             }
@@ -227,18 +228,6 @@ impl ClipboardManager {
         }
     }
 
-    fn with_clipboard<F, T>(&self, f: F) -> Result<T>
-    where
-        F: FnOnce(&mut Clipboard) -> Result<T>,
-    {
-        let mut guard = self.clipboard.write();
-        match guard.as_mut() {
-            Some(clipboard) => f(clipboard),
-            None => anyhow::bail!("Clipboard not available"),
-        }
-    }
-
-    /// Async-safe clipboard operation with timeout - prevents blocking the runtime
     async fn with_clipboard_async<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&mut Clipboard) -> Result<T> + Send + 'static,
@@ -366,9 +355,11 @@ impl ClipboardManager {
         Ok(())
     }
 
-    pub async fn run_daemon(&mut self) -> Result<()> {
-        let (tx, rx) = mpsc::channel(10);
-        self.command_rx = Some(rx);
+    pub async fn run_daemon(self) -> Result<()> {
+        use tokio::sync::Mutex as AsyncMutex;
+        use tower::{ServiceBuilder, ServiceExt};
+
+        let (tx, mut rx) = mpsc::channel(10);
 
         #[cfg(unix)]
         let sock_path = std::env::temp_dir().join("nocb.sock");
@@ -376,83 +367,75 @@ impl ClipboardManager {
         #[cfg(windows)]
         let sock_path = PathBuf::from(r"\\.\pipe\nocb");
 
-        let tx_clone = tx.clone();
-        let sock_path_clone = sock_path.clone();
+        let cache_dir = self.config.cache_dir.clone();
+        let max_entries = self.config.max_entries;
+        let max_age_days = self.config.max_age_days;
 
+        let manager = Arc::new(AsyncMutex::new(self));
+
+        let sock_path_clone = sock_path.clone();
         let ipc_handle = tokio::spawn(async move {
-            let result = Self::ipc_server(tx_clone, sock_path_clone.clone()).await;
+            let result = Self::ipc_server(tx, sock_path_clone.clone()).await;
             #[cfg(unix)]
             let _ = std::fs::remove_file(&sock_path_clone);
             result
         });
 
+        let service = ServiceBuilder::new()
+            .layer(ClipboardRecoveryLayer::new(manager.clone()))
+            .service(ClipboardRouter::new(manager.clone()));
+
         let mut interval = tokio::time::interval(Duration::from_millis(POLL_INTERVAL_MS));
         let mut cleanup_counter = 0u64;
+        let mut watchdog_interval =
+            tokio::time::interval(Duration::from_secs(WATCHDOG_INTERVAL_SECS));
 
-        // Watchdog ticker - ping systemd every 30 seconds
-        let mut watchdog_interval = tokio::time::interval(Duration::from_secs(WATCHDOG_INTERVAL_SECS));
-
-        // Notify systemd we're ready
         #[cfg(unix)]
         let _ = sd_notify::notify(false, &[NotifyState::Ready]);
 
-        loop {
+        let result: Result<()> = loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if let Err(e) = self.poll_clipboard().await {
-                        eprintln!("Poll error: {}", e);
+                    if let Err(e) = service.clone().oneshot(Request::Poll).await {
+                        eprintln!("Fatal poll error: {}", e);
+                        break Err(e);
                     }
 
                     cleanup_counter += 1;
-                    // Run cleanup every ~100 seconds (in background task)
                     if cleanup_counter % 1000 == 0 {
-                        let cache_dir = self.config.cache_dir.clone();
-                        let max_entries = self.config.max_entries;
-                        let max_age_days = self.config.max_age_days;
+                        let cache_dir = cache_dir.clone();
                         tokio::task::spawn_blocking(move || {
-                            // Cleanup runs in background, doesn't block main loop
                             let _ = Self::cleanup_old_entries_blocking(&cache_dir, max_entries, max_age_days);
                         });
                     }
                 }
 
                 _ = watchdog_interval.tick() => {
-                    // Send watchdog ping to systemd
                     #[cfg(unix)]
                     let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
                 }
 
-                cmd = async { self.command_rx.as_mut()?.recv().await } => {
-                    if let Some(cmd) = cmd {
-                        match cmd {
-                            Command::Copy(selection) => {
-                                if let Err(e) = self.copy_selection(&selection).await {
-                                    eprintln!("Copy error: {}", e);
-                                }
-                            }
-                            Command::Exit => break,
-                            Command::Clear => {
-                                if let Err(e) = self.clear().await {
-                                    eprintln!("Clear error: {}", e);
-                                }
-                            }
-                            Command::Prune(hashes) => {
-                                if let Err(e) = self.prune(&hashes) {
-                                    eprintln!("Prune error: {}", e);
-                                }
-                            }
-                        }
+                cmd = rx.recv() => {
+                    let Some(cmd) = cmd else { break Ok(()) };
+                    let req = match cmd {
+                        Command::Exit => break Ok(()),
+                        Command::Copy(s) => Request::Copy(s),
+                        Command::Clear => Request::Clear,
+                        Command::Prune(h) => Request::Prune(h),
+                    };
+                    if let Err(e) = service.clone().oneshot(req).await {
+                        eprintln!("Command error: {}", e);
                     }
                 }
             }
-        }
+        };
 
         #[cfg(unix)]
         let _ = std::fs::remove_file(&sock_path);
 
         ipc_handle.abort();
 
-        Ok(())
+        result
     }
 
     async fn handle_ipc_command(cmd: &str, tx: &mpsc::Sender<Command>) -> Result<()> {
@@ -517,21 +500,23 @@ impl ClipboardManager {
                 let tx = tx.clone();
 
                 tokio::spawn(async move {
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = vec![0u8; MAX_IPC_MESSAGE_SIZE];
+                    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                        use tokio::io::AsyncReadExt;
+                        let mut buf = vec![0u8; MAX_IPC_MESSAGE_SIZE];
 
-                    match stream.read(&mut buf).await {
-                        Ok(n) if n > IPC_MAGIC.len() => {
-                            if &buf[..IPC_MAGIC.len()] != IPC_MAGIC {
-                                return;
-                            }
+                        match stream.read(&mut buf).await {
+                            Ok(n) if n > IPC_MAGIC.len() => {
+                                if &buf[..IPC_MAGIC.len()] != IPC_MAGIC {
+                                    return;
+                                }
 
-                            if let Ok(cmd) = String::from_utf8(buf[IPC_MAGIC.len()..n].to_vec()) {
-                                let _ = Self::handle_ipc_command(&cmd, &tx).await;
+                                if let Ok(cmd) = String::from_utf8(buf[IPC_MAGIC.len()..n].to_vec()) {
+                                    let _ = Self::handle_ipc_command(&cmd, &tx).await;
+                                }
                             }
+                            _ => {}
                         }
-                        _ => {}
-                    }
+                    }).await;
                 });
             }
         }
@@ -620,6 +605,11 @@ impl ClipboardManager {
         Ok(())
     }
 
+    fn is_clipboard_dead(err: &arboard::Error) -> bool {
+        let s = format!("{}", err);
+        s.contains("stopped") || s.contains("handler")
+    }
+
     async fn poll_clipboard(&mut self) -> Result<()> {
         const MAX_FAILURES: u32 = 3;
 
@@ -639,25 +629,34 @@ impl ClipboardManager {
                                     self.clipboard_failures = 0;
                                     Some(ClipboardContent::Text(text))
                                 }
-                                Err(_) => match clipboard.get_image() {
-                                    Ok(img) => {
-                                        self.clipboard_failures = 0;
-                                        Some(ClipboardContent::Image(img))
-                                    }
-                                    Err(e) => {
-                                        // Check if this is a "handler stopped" error
-                                        let err_str = format!("{}", e);
-                                        if err_str.contains("stopped") || err_str.contains("handler") {
-                                            self.clipboard_failures += 1;
-                                            reinit_reason = Some(format!("Clipboard error ({}/{}): {}", self.clipboard_failures, MAX_FAILURES, e));
-                                            if self.clipboard_failures >= MAX_FAILURES {
-                                                needs_reinit = true;
+                                Err(text_err) => {
+                                    if Self::is_clipboard_dead(&text_err) {
+                                        self.clipboard_failures += 1;
+                                        reinit_reason = Some(format!("Clipboard error ({}/{}): {}", self.clipboard_failures, MAX_FAILURES, text_err));
+                                        if self.clipboard_failures >= MAX_FAILURES {
+                                            needs_reinit = true;
+                                        }
+                                        None
+                                    } else {
+                                        match clipboard.get_image() {
+                                            Ok(img) => {
+                                                self.clipboard_failures = 0;
+                                                Some(ClipboardContent::Image(img))
                                             }
-                                            None
-                                        } else {
-                                            // Normal "no content" case
-                                            self.clipboard_failures = 0;
-                                            None
+                                            Err(img_err) => {
+                                                if Self::is_clipboard_dead(&img_err) {
+                                                    self.clipboard_failures += 1;
+                                                    reinit_reason = Some(format!("Clipboard error ({}/{}): {}", self.clipboard_failures, MAX_FAILURES, img_err));
+                                                    if self.clipboard_failures >= MAX_FAILURES {
+                                                        needs_reinit = true;
+                                                    }
+                                                    None
+                                                } else {
+                                                    // Normal "no content" case
+                                                    self.clipboard_failures = 0;
+                                                    None
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -684,7 +683,7 @@ impl ClipboardManager {
             eprintln!("{}", reason);
         }
         if needs_reinit {
-            let _ = self.reinitialize_clipboard().await;
+            self.reinitialize_clipboard().await?;
             return Ok(());
         }
         if content.is_none() && self.clipboard_failures > 0 {
@@ -786,7 +785,7 @@ impl ClipboardManager {
                 params![
                     SystemTime::now()
                         .duration_since(UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_default()
                         .as_secs() as i64,
                     hash
                 ],
@@ -931,50 +930,6 @@ impl ClipboardManager {
         Ok(())
     }
 
-    fn cleanup_old_entries(&mut self) -> Result<()> {
-        // Clean by max entries
-        let mut stmt = self.db.prepare(
-            "SELECT hash FROM entries 
-             WHERE id NOT IN (
-                 SELECT id FROM entries ORDER BY timestamp DESC LIMIT ?1
-             )",
-        )?;
-
-        let hashes_to_delete: Vec<String> = stmt
-            .query_map(params![self.config.max_entries as i64], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        drop(stmt);
-
-        // Clean by age
-        let cutoff = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
-            - (self.config.max_age_days as u64 * 86400);
-
-        let mut stmt = self
-            .db
-            .prepare("SELECT hash FROM entries WHERE timestamp < ?1")?;
-
-        let old_hashes: Vec<String> = stmt
-            .query_map(params![cutoff as i64], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        drop(stmt);
-
-        // Delete all collected hashes
-        for hash in hashes_to_delete.into_iter().chain(old_hashes) {
-            self.delete_entry(&hash)?;
-        }
-
-        // VACUUM occasionally (every 100 cleanups)
-        static VACUUM_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if VACUUM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100 == 0 {
-            let _ = self.db.execute("VACUUM", []);
-        }
-
-        Ok(())
-    }
-
-    /// Static version for running in spawn_blocking - doesn't need &mut self
     fn cleanup_old_entries_blocking(cache_dir: &Path, max_entries: usize, max_age_days: u32) -> Result<()> {
         let db_path = cache_dir.join("index.db");
         let db = SqliteConnection::open(&db_path)?;
@@ -1028,9 +983,13 @@ impl ClipboardManager {
             let _ = fs::remove_file(&zst_path);
         }
 
-        // VACUUM occasionally (every 100 cleanups)
+        // WAL checkpoint + VACUUM occasionally (every 100 cleanups)
         static VACUUM_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if VACUUM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100 == 0 {
+        let count = VACUUM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count % 10 == 0 {
+            let _ = db.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
+        }
+        if count % 100 == 0 {
             let _ = db.execute("VACUUM", []);
         }
 
@@ -1126,7 +1085,7 @@ impl ClipboardManager {
     pub fn format_time_ago(&self, timestamp: i64) -> String {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         let ago_secs = now.saturating_sub(timestamp as u64);
 

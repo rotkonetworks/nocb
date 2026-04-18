@@ -80,14 +80,6 @@ impl EntryCache {
         }
     }
 
-    pub fn get(&self, hash: &str) -> Option<CachedEntry> {
-        self.inner.write().get(hash).cloned()
-    }
-
-    pub fn peek(&self, hash: &str) -> Option<CachedEntry> {
-        self.inner.read().peek(hash).cloned()
-    }
-
     pub fn put(&self, hash: String, entry: CachedEntry) {
         self.inner.write().put(hash, entry);
     }
@@ -113,13 +105,5 @@ impl EntryCache {
 
     pub fn get_hashes(&self) -> Vec<String> {
         self.inner.read().iter().map(|(k, _)| k.clone()).collect()
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.read().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.read().is_empty()
     }
 }

@@ -51,7 +51,7 @@ enum Commands {
     },
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Daemon => {
-            let mut manager = ClipboardManager::new(config).await?;
+            let manager = ClipboardManager::new(config).await?;
 
             tokio::select! {
                 result = manager.run_daemon() => {

@@ -199,33 +199,6 @@ mod daemon {
         Ok(())
     }
 
-    pub fn search_clips(query: &str, full_content: bool) -> Result<Vec<ClipEntry>, Box<dyn std::error::Error>> {
-        let mut cmd = Command::new("nocb");
-        cmd.arg("search");
-
-        if full_content {
-            cmd.arg("--full");
-        }
-
-        if !query.is_empty() {
-            cmd.arg(query);
-        }
-
-        let output = cmd.output()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut clips = Vec::new();
-
-        for (id, line) in stdout.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let entry = parse_structured_entry(line, id)?;
-            clips.push(entry);
-        }
-
-        Ok(clips)
-    }
 }
 
 struct ClipperGui {

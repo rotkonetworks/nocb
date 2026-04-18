@@ -38,6 +38,10 @@ toml = "0.8"
 # Async runtime
 tokio = { workspace = true }
 
+# Service abstraction
+tower = { version = "0.5", features = ["util", "timeout"] }
+futures = "0.3"
+
 # Security
 zeroize = "1.7"
 
