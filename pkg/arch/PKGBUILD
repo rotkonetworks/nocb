@@ -4,11 +4,11 @@
 pkgname=nocb
 pkgver=1.1.7
 pkgrel=1
-pkgdesc="x11 clipboard manager with compression and fts"
+pkgdesc="clipboard manager with compression and fts"
 arch=('x86_64')
 url="https://github.com/rotkonetworks/nocb"
 license=('MIT')
-depends=('gcc-libs')
+depends=('gcc-libs' 'wayland')
 makedepends=('cargo' 'git')
 install=nocb.install
 source=("git+${url}.git#tag=v${pkgver}")

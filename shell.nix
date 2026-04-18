@@ -20,6 +20,10 @@ pkgs.mkShell {
     xorg.libXcursor
     xorg.libXrandr
     xorg.libXi
+
+    # Wayland dependencies
+    wayland
+    wayland-protocols
     
     # OpenGL/Vulkan support
     libGL

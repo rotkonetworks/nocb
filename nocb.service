@@ -5,11 +5,16 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sh -c 'until xdpyinfo >/dev/null 2>&1; do sleep 1; done'
-ExecStart=/usr/bin/nocb daemon
+ExecStart=/bin/sh -c '\
+  if [ -n "$WAYLAND_DISPLAY" ]; then \
+    exec /usr/bin/nocb daemon; \
+  fi; \
+  for i in 0 1 2 3 4 5; do \
+    DISPLAY=:$i xdpyinfo >/dev/null 2>&1 && exec env DISPLAY=:$i /usr/bin/nocb daemon; \
+  done; \
+  sleep 2; exit 1'
 Restart=always
 RestartSec=2
-Environment="DISPLAY=:0"
 Environment="XAUTHORITY=%h/.Xauthority"
 MemoryMax=256M
 CPUQuota=10%

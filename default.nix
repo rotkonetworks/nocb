@@ -5,6 +5,8 @@
 , sqlite
 , libX11
 , libxcb
+, wayland
+, wayland-protocols
 }:
 
 rustPlatform.buildRustPackage rec {
@@ -28,10 +30,12 @@ rustPlatform.buildRustPackage rec {
    sqlite
    libX11
    libxcb
+   wayland
+   wayland-protocols
  ];
 
  meta = with lib; {
-   description = "X11 clipboard manager with compression and blob storage";
+   description = "clipboard manager with compression and blob storage";
    homepage = "https://github.com/hitchhooker/nocb";
    license = licenses.mit;
    maintainers = with maintainers; [ ];

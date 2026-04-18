@@ -1,5 +1,5 @@
 {
- description = "X11 clipboard manager with compression and blob storage";
+ description = "clipboard manager with compression and blob storage";
 
  inputs = {
    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -24,10 +24,10 @@
          };
          
          nativeBuildInputs = [ pkg-config ];
-         buildInputs = [ sqlite libX11 libxcb ];
+         buildInputs = [ sqlite libX11 libxcb wayland wayland-protocols ];
          
          meta = {
-           description = "X11 clipboard manager with compression and blob storage";
+           description = "clipboard manager with compression and blob storage";
            homepage = "https://github.com/hitchhooker/nocb";
            license = lib.licenses.mit;
            mainProgram = "nocb";
@@ -42,6 +42,8 @@
            sqlite
            libX11
            libxcb
+           wayland
+           wayland-protocols
          ];
        };
      });
