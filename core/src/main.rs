@@ -17,6 +17,8 @@ struct Cli {
 enum Commands {
     /// Run clipboard daemon
     Daemon,
+    /// Serve the clipboard to Claude Code over MCP (JSON-RPC on stdio)
+    Mcp,
     /// Print clipboard history for rofi
     Print,
     /// Search clipboard history with full content
@@ -55,19 +57,9 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // platform-specific display check
-    #[cfg(target_os = "linux")]
-    {
-        if std::env::var("DISPLAY").is_err() && std::env::var("WAYLAND_DISPLAY").is_err() {
-            eprintln!("Error: No display server available (neither X11 nor Wayland)");
-            std::process::exit(1);
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        // arboard handles clipboard natively on macos/windows
-    }
+    // No up-front display check: the daemon discovers and waits for a display at
+    // runtime (see ClipboardManager::try_reconnect), and the read-only commands
+    // (print/search/complete) only touch the local DB, so they work headless.
 
     let config = Config::load().context("Failed to load configuration")?;
 
@@ -86,6 +78,10 @@ async fn main() -> Result<()> {
                     println!("\nShutting down...");
                 }
             }
+        }
+        Commands::Mcp => {
+            let manager = ClipboardManager::new(config).await?;
+            manager.run_mcp()?;
         }
         Commands::Print => {
             let manager = ClipboardManager::new(config).await?;

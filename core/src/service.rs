@@ -112,8 +112,8 @@ where
             match inner.call(req.clone()).await {
                 Ok(r) => Ok(r),
                 Err(e) if is_clipboard_dead(&e) => {
-                    eprintln!("Clipboard dead ({}), reinitializing and retrying", e);
-                    manager.lock().await.reinitialize_clipboard().await?;
+                    eprintln!("Clipboard dead ({}), reconnecting and retrying", e);
+                    manager.lock().await.try_reconnect().await;
                     inner.call(req).await
                 }
                 Err(e) => Err(e),

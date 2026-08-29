@@ -21,6 +21,7 @@ zstd = "0.13"
 
 # Image processing
 image = "0.25"
+base64 = "0.22"
 
 # Database
 rusqlite = { version = "0.30", features = ["bundled"] }

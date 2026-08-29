@@ -1,4 +1,5 @@
 mod cache;
+mod mcp;
 mod service;
 use cache::{CachedEntry, EntryCache};
 use service::{ClipboardRecoveryLayer, ClipboardRouter, Request};
@@ -13,7 +14,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use zeroize::Zeroize;
 
@@ -29,7 +30,8 @@ const IPC_MAGIC: &[u8] = b"NOCB\x00\x01";
 const LRU_CACHE_SIZE: usize = 64;
 const CLIPBOARD_TIMEOUT_MS: u64 = 5000; // 5 second timeout for clipboard ops
 const WATCHDOG_INTERVAL_SECS: u64 = 30; // Send watchdog ping every 30s
-const MAX_REINIT_ATTEMPTS: u32 = 5; // Max clipboard reinits before giving up
+const RECONNECT_BACKOFF_START_MS: u64 = 500; // First retry delay when the display is gone
+const RECONNECT_BACKOFF_MAX_MS: u64 = 30_000; // Cap between reconnect attempts
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -146,6 +148,125 @@ enum ClipboardContent<'a> {
     Image(ImageData<'a>),
 }
 
+/// X displays that currently have a listening socket in `/tmp/.X11-unix`, with
+/// the inherited `$DISPLAY` (if any) tried first. This is how we find the live
+/// session without shelling out to `xdpyinfo`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn candidate_displays() -> Vec<String> {
+    let mut displays = Vec::new();
+    if let Ok(d) = std::env::var("DISPLAY")
+        && !d.is_empty()
+    {
+        displays.push(d);
+    }
+    if let Ok(entries) = std::fs::read_dir("/tmp/.X11-unix") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(num) = name.strip_prefix('X')
+                && !num.is_empty()
+                && num.bytes().all(|b| b.is_ascii_digit())
+            {
+                let disp = format!(":{num}");
+                if !displays.contains(&disp) {
+                    displays.push(disp);
+                }
+            }
+        }
+    }
+    displays
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn push_auth(auths: &mut Vec<Option<PathBuf>>, path: PathBuf) {
+    if path.is_file() && !auths.iter().any(|a| a.as_deref() == Some(path.as_path())) {
+        auths.push(Some(path));
+    }
+}
+
+/// Candidate `XAUTHORITY` cookie files, most-likely first. Display managers put
+/// the cookie in wildly different places (`~/.Xauthority`, `$XDG_RUNTIME_DIR`,
+/// `gdm/Xauthority`, ly's `lyxauth`, …) and rotate it on every login, so we
+/// probe rather than hard-code. A trailing `None` means "use whatever the
+/// environment already has" as a last resort.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn candidate_xauthorities() -> Vec<Option<PathBuf>> {
+    let mut auths: Vec<Option<PathBuf>> = Vec::new();
+    if let Ok(x) = std::env::var("XAUTHORITY")
+        && !x.is_empty()
+    {
+        push_auth(&mut auths, PathBuf::from(x));
+    }
+    if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
+        let rt = PathBuf::from(rt);
+        if let Ok(entries) = std::fs::read_dir(&rt) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().contains("auth") {
+                    push_auth(&mut auths, entry.path());
+                }
+            }
+        }
+        push_auth(&mut auths, rt.join("gdm/Xauthority"));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        push_auth(&mut auths, PathBuf::from(home).join(".Xauthority"));
+    }
+    auths.push(None);
+    auths
+}
+
+/// Probe live X displays against candidate auth cookies until `Clipboard::new()`
+/// succeeds — the successful pair *is* the working session, so no separate
+/// `xdpyinfo` check is needed. The winning `(DISPLAY, XAUTHORITY)` is left in
+/// this process's environment for arboard's background X thread to use. On
+/// Wayland we trust the inherited environment.
+///
+/// Returns `None` when no display server is reachable yet (X may simply not be
+/// up); the caller retries with backoff instead of exiting.
+fn connect_clipboard() -> Option<Clipboard> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if std::env::var("WAYLAND_DISPLAY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            return Clipboard::new().ok();
+        }
+
+        for display in &candidate_displays() {
+            for auth in &candidate_xauthorities() {
+                // SAFETY: nocb's daemon runtime is single-threaded (tokio
+                // current_thread) and the previous clipboard — with its arboard
+                // X thread — has already been dropped before we probe, so no
+                // other thread reads the environment concurrently here.
+                unsafe {
+                    std::env::set_var("DISPLAY", display);
+                    match auth {
+                        Some(path) => std::env::set_var("XAUTHORITY", path),
+                        None => std::env::remove_var("XAUTHORITY"),
+                    }
+                }
+                if let Ok(clipboard) = Clipboard::new() {
+                    eprintln!(
+                        "nocb: clipboard connected on DISPLAY={display} XAUTHORITY={}",
+                        auth.as_deref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "<inherited>".to_string())
+                    );
+                    return Some(clipboard);
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        // macOS / Windows: arboard talks to the native clipboard directly.
+        Clipboard::new().ok()
+    }
+}
+
 pub struct ClipboardManager {
     config: Config,
     db: SqliteConnection,
@@ -153,7 +274,10 @@ pub struct ClipboardManager {
     last_clipboard_hash: Option<String>,
     cache: EntryCache,
     clipboard_failures: u32,
-    total_reinit_attempts: u32,
+    /// Current delay before the next reconnect attempt (grows on repeated failure).
+    reconnect_backoff_ms: u64,
+    /// Earliest instant we're allowed to retry; `None` means "try now".
+    next_reconnect_at: Option<Instant>,
 }
 
 impl ClipboardManager {
@@ -165,65 +289,67 @@ impl ClipboardManager {
         let db = SqliteConnection::open(&db_path)?;
         Self::init_db(&db)?;
 
-        let clipboard = Clipboard::new().context("Failed to initialize clipboard")?;
+        // The clipboard is connected lazily by the daemon (see `try_reconnect`).
+        // Read-only commands (`print`, `search`, `complete`) never touch X, so
+        // they work headless — e.g. over SSH or before the session is up.
         let cache = EntryCache::new(LRU_CACHE_SIZE);
 
         Ok(Self {
             config,
             db,
-            clipboard: Arc::new(RwLock::new(Some(clipboard))),
+            clipboard: Arc::new(RwLock::new(None)),
             last_clipboard_hash: None,
             cache,
             clipboard_failures: 0,
-            total_reinit_attempts: 0,
+            reconnect_backoff_ms: RECONNECT_BACKOFF_START_MS,
+            next_reconnect_at: None,
         })
     }
 
-    async fn reinitialize_clipboard(&mut self) -> Result<()> {
-        self.total_reinit_attempts += 1;
-        eprintln!("Reinitializing clipboard connection (attempt {}/{})...",
-            self.total_reinit_attempts, MAX_REINIT_ATTEMPTS);
-
-        if self.total_reinit_attempts > MAX_REINIT_ATTEMPTS {
-            eprintln!("Too many clipboard reinit attempts, exiting for systemd restart");
-            anyhow::bail!("Clipboard unrecoverable after {} reinit attempts", MAX_REINIT_ATTEMPTS);
-        }
-
-        // Drop the old clipboard
+    /// (Re)establish the clipboard connection by re-discovering the live X
+    /// display and auth cookie. This is the *only* recovery path: it never
+    /// returns an error and never exits the process. When no display is
+    /// reachable (X down, between logins, …) it backs off and leaves the
+    /// clipboard disconnected — the daemon stays alive and reconnects
+    /// automatically once a session appears, even on a new display or cookie.
+    ///
+    /// Re-discovering on every attempt is what makes this survive X restarts:
+    /// the cookie path that was valid at boot is often stale after a relogin.
+    pub async fn try_reconnect(&mut self) {
+        // Honour the backoff window so we don't hammer X while it's down.
+        if let Some(at) = self.next_reconnect_at
+            && Instant::now() < at
         {
-            let mut clipboard_guard = self.clipboard.write();
-            *clipboard_guard = None;
+            return;
         }
 
-        // Small delay to let X11/Wayland clean up (async, non-blocking)
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Drop the old connection first so its arboard X thread exits before we
+        // probe — keeps the env-var probing in `connect_clipboard` race-free.
+        {
+            *self.clipboard.write() = None;
+        }
 
-        // Create new clipboard with timeout to prevent hanging
-        let clipboard_result = tokio::time::timeout(
+        let result = tokio::time::timeout(
             Duration::from_millis(CLIPBOARD_TIMEOUT_MS),
-            tokio::task::spawn_blocking(Clipboard::new)
-        ).await;
+            tokio::task::spawn_blocking(connect_clipboard),
+        )
+        .await;
 
-        match clipboard_result {
-            Ok(Ok(Ok(new_clipboard))) => {
-                let mut clipboard_guard = self.clipboard.write();
-                *clipboard_guard = Some(new_clipboard);
+        match result {
+            Ok(Ok(Some(clipboard))) => {
+                *self.clipboard.write() = Some(clipboard);
                 self.clipboard_failures = 0;
-                self.total_reinit_attempts = 0;
-                eprintln!("Clipboard reinitialized successfully");
-                Ok(())
+                self.reconnect_backoff_ms = RECONNECT_BACKOFF_START_MS;
+                self.next_reconnect_at = None;
             }
-            Ok(Ok(Err(e))) => {
-                eprintln!("Failed to reinitialize clipboard: {}", e);
-                Err(anyhow::anyhow!("Clipboard reinitialization failed: {}", e))
-            }
-            Ok(Err(e)) => {
-                eprintln!("Clipboard task panicked: {}", e);
-                Err(anyhow::anyhow!("Clipboard task panicked: {}", e))
-            }
-            Err(_) => {
-                eprintln!("Clipboard reinitialization timed out");
-                Err(anyhow::anyhow!("Clipboard reinitialization timed out"))
+            _ => {
+                // No reachable display (or the probe timed out). Schedule the
+                // next attempt with exponential backoff and keep running.
+                let backoff = self.reconnect_backoff_ms;
+                self.next_reconnect_at = Some(Instant::now() + Duration::from_millis(backoff));
+                self.reconnect_backoff_ms =
+                    backoff.saturating_mul(2).min(RECONNECT_BACKOFF_MAX_MS);
+                eprintln!("nocb: no display reachable; retrying clipboard connection in {backoff}ms");
             }
         }
     }
@@ -353,6 +479,13 @@ impl ClipboardManager {
         }
 
         Ok(())
+    }
+
+    /// Serve the clipboard over the Model Context Protocol (JSON-RPC 2.0 on
+    /// stdio) so Claude Code can read it directly. Reads the DB only — no X
+    /// connection and no running daemon required.
+    pub fn run_mcp(&self) -> Result<()> {
+        mcp::serve(self)
     }
 
     pub async fn run_daemon(self) -> Result<()> {
@@ -663,9 +796,10 @@ impl ClipboardManager {
                             }
                         }
                         None => {
-                            // Clipboard not initialized
+                            // Not connected yet — let try_reconnect (which is
+                            // backoff-gated and logs meaningfully) handle it,
+                            // without spamming a line on every poll tick.
                             needs_reinit = true;
-                            reinit_reason = Some("Clipboard not initialized".to_string());
                             None
                         }
                     };
@@ -683,7 +817,7 @@ impl ClipboardManager {
             eprintln!("{}", reason);
         }
         if needs_reinit {
-            self.reinitialize_clipboard().await?;
+            self.try_reconnect().await;
             return Ok(());
         }
         if content.is_none() && self.clipboard_failures > 0 {
@@ -1634,6 +1768,101 @@ impl ClipboardManager {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(entries)
+    }
+
+    /// Full text content for an entry matched by hash prefix: inline text, or the
+    /// (decompressed) blob for `text_file`. Returns `None` for images or a miss.
+    /// Used by the MCP server to hand complete clipboard contents to Claude.
+    pub fn get_full_text(&self, hash_prefix: &str) -> Result<Option<String>> {
+        let mut stmt = self.db.prepare(
+            "SELECT content_type, inline_text, file_path, compressed
+             FROM entries WHERE hash LIKE ?1 || '%' ORDER BY timestamp DESC LIMIT 1",
+        )?;
+
+        let row = stmt
+            .query_row([hash_prefix], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<i64>>(3)?.map(|v| v != 0),
+                ))
+            })
+            .optional()?;
+
+        let Some((content_type, inline_text, file_path, compressed)) = row else {
+            return Ok(None);
+        };
+
+        match content_type.as_str() {
+            "text" => Ok(inline_text),
+            "text_file" => {
+                let Some(fp) = file_path else { return Ok(None) };
+                let path = self.config.cache_dir.join("blobs").join(&fp);
+                if compressed.unwrap_or(false) || fp.ends_with(".zst") {
+                    use zstd::stream::read::Decoder;
+                    let file = fs::File::open(path)?;
+                    let mut decoder = Decoder::new(file)?;
+                    let mut text = String::new();
+                    decoder.read_to_string(&mut text)?;
+                    Ok(Some(text))
+                } else {
+                    Ok(Some(fs::read_to_string(path)?))
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Read an image entry's raw bytes plus its mime and dimensions.
+    /// Mirrors `get_full_text`'s decompression handling: images are currently
+    /// stored uncompressed, but honour the `compressed` flag defensively so a
+    /// future change to the storage policy cannot silently serve zstd bytes.
+    pub fn get_image_blob(
+        &self,
+        hash_prefix: &str,
+    ) -> Result<Option<(Vec<u8>, String, u32, u32)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT file_path, compressed, mime_type, width, height
+             FROM entries WHERE hash LIKE ?1 || '%' AND content_type = 'image'
+             ORDER BY timestamp DESC LIMIT 1",
+        )?;
+
+        let row = stmt
+            .query_row([hash_prefix], |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<i64>>(1)?.map(|v| v != 0),
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                ))
+            })
+            .optional()?;
+
+        let Some((file_path, compressed, mime, width, height)) = row else {
+            return Ok(None);
+        };
+        let Some(fp) = file_path else { return Ok(None) };
+
+        let path = self.config.cache_dir.join("blobs").join(&fp);
+        let bytes = if compressed.unwrap_or(false) || fp.ends_with(".zst") {
+            use zstd::stream::read::Decoder;
+            let file = fs::File::open(path)?;
+            let mut decoder = Decoder::new(file)?;
+            let mut buf = Vec::new();
+            decoder.read_to_end(&mut buf)?;
+            buf
+        } else {
+            fs::read(path)?
+        };
+
+        Ok(Some((
+            bytes,
+            mime.unwrap_or_else(|| "image/png".to_string()),
+            width.unwrap_or(0) as u32,
+            height.unwrap_or(0) as u32,
+        )))
     }
 
     pub fn get_entries(&self, limit: usize) -> Result<Vec<(String, String, String, i64, i64)>> {

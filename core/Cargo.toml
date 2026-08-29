@@ -50,6 +50,7 @@ zstd = { workspace = true }
 
 # Image processing
 image = { workspace = true }
+base64 = { workspace = true }
 
 # System directories
 dirs = "5.0"

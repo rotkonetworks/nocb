@@ -1,25 +1,18 @@
 [Unit]
 Description=NOCB Clipboard Manager
-After=graphical-session.target
+# Start once the user session is up, but the daemon does not hard-depend on a
+# display: it discovers and waits for X/Wayland at runtime and reconnects across
+# X restarts on its own (see ClipboardManager::try_reconnect).
+After=default.target
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=/bin/sh -c '\
-  if [ -n "$WAYLAND_DISPLAY" ]; then \
-    exec /usr/bin/nocb daemon; \
-  fi; \
-  for i in 0 1 2 3 4 5; do \
-    DISPLAY=:$i xdpyinfo >/dev/null 2>&1 && exec env DISPLAY=:$i /usr/bin/nocb daemon; \
-  done; \
-  sleep 2; exit 1'
-Restart=always
+ExecStart=/usr/bin/nocb daemon
+Restart=on-failure
 RestartSec=2
-Environment="XAUTHORITY=%h/.Xauthority"
 MemoryMax=256M
 CPUQuota=10%
-RestartForceExitStatus=1
-SuccessExitStatus=0
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target
