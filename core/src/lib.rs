@@ -352,7 +352,9 @@ impl ClipboardManager {
                 // connection and in-process reconnects can never succeed. Exit so
                 // systemd restarts us with fresh library state; a fresh process
                 // that can't reach X backs off in-process, so this can't loop.
-                if let Err(e @ arboard::Error::Unknown { .. }) = clipboard.get_text() {
+                if let Err(e) = clipboard.get_text()
+                    && Self::is_connection_error(&e)
+                {
                     eprintln!("nocb: X connection is dead and arboard cannot reconnect in-process ({e}); exiting for a clean restart");
                     std::process::exit(1);
                 }
@@ -822,15 +824,29 @@ impl ClipboardManager {
         Ok(())
     }
 
-    /// Only "nothing usable on the clipboard" is benign. Every other arboard
-    /// error means the connection is unhealthy — notably `Unknown` wrapping
-    /// EPIPE once the X server has dropped our connection, which used to be
-    /// mistaken for an empty clipboard and left the daemon deaf for good.
+    /// The X connection itself is gone (EPIPE etc. from the socket, or an x11rb
+    /// `ConnectionError`). arboard wraps these in `Error::Unknown`, which it also
+    /// uses for data problems like "incorrect type received from clipboard"
+    /// (e.g. a Qt app offering only images), so match the description.
+    pub(crate) fn is_connection_error(err: &arboard::Error) -> bool {
+        match err {
+            arboard::Error::Unknown { description } => {
+                description.contains("(os error") || description.contains("connection error")
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether an error should count towards reconnecting. Content/data problems
+    /// are benign (the clipboard simply holds something we can't read as this
+    /// type); a broken connection is not — it used to be mistaken for an empty
+    /// clipboard and left the daemon deaf for good.
     pub(crate) fn is_clipboard_dead(err: &arboard::Error) -> bool {
-        !matches!(
-            err,
-            arboard::Error::ContentNotAvailable | arboard::Error::ConversionFailure
-        )
+        match err {
+            arboard::Error::ContentNotAvailable | arboard::Error::ConversionFailure => false,
+            arboard::Error::Unknown { .. } => Self::is_connection_error(err),
+            _ => true,
+        }
     }
 
     async fn poll_clipboard(&mut self) -> Result<()> {
@@ -2203,5 +2219,34 @@ impl ClipboardManager {
         // Escape quotes and wrap in quotes for phrase matching
         let escaped = query.replace('"', "\"\"");
         format!("\"{}\"", escaped)
+    }
+}
+
+#[cfg(test)]
+mod clipboard_error_tests {
+    use super::ClipboardManager;
+    use arboard::Error;
+
+    fn unknown(d: &str) -> Error {
+        Error::Unknown { description: d.to_string() }
+    }
+
+    #[test]
+    fn dead_connection_is_detected() {
+        // Seen when the X server dropped the daemon's connection (2026-10-07).
+        let e = unknown("Broken pipe (os error 32)");
+        assert!(ClipboardManager::is_connection_error(&e));
+        assert!(ClipboardManager::is_clipboard_dead(&e));
+    }
+
+    #[test]
+    fn unreadable_content_is_not_dead() {
+        // Seen with a Flameshot (Qt) image on the clipboard; treating it as a
+        // dead connection made the daemon restart-loop.
+        let e = unknown("incorrect type received from clipboard");
+        assert!(!ClipboardManager::is_connection_error(&e));
+        assert!(!ClipboardManager::is_clipboard_dead(&e));
+        assert!(!ClipboardManager::is_clipboard_dead(&Error::ContentNotAvailable));
+        assert!(!ClipboardManager::is_clipboard_dead(&Error::ConversionFailure));
     }
 }
