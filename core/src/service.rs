@@ -88,8 +88,14 @@ pub struct ClipboardRecovery<S> {
 }
 
 fn is_clipboard_dead(err: &Error) -> bool {
-    let s = err.to_string();
-    s.contains("stopped") || s.contains("handler") || s.contains("not available")
+    match err.downcast_ref::<arboard::Error>() {
+        Some(e) => ClipboardManager::is_clipboard_dead(e),
+        // Errors raised by nocb itself around the clipboard call.
+        None => {
+            let s = err.to_string();
+            s.contains("Clipboard not available") || s.contains("timed out")
+        }
+    }
 }
 
 impl<S> Service<Request> for ClipboardRecovery<S>

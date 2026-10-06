@@ -29,6 +29,9 @@ const MAX_IPC_MESSAGE_SIZE: usize = 4096;
 const IPC_MAGIC: &[u8] = b"NOCB\x00\x01";
 const LRU_CACHE_SIZE: usize = 64;
 const CLIPBOARD_TIMEOUT_MS: u64 = 5000; // 5 second timeout for clipboard ops
+/// The daemon only pings the systemd watchdog while the clipboard has been read
+/// successfully (or a reconnect is actively being attempted) within this window.
+const HEALTH_STALE_SECS: u64 = 60;
 const WATCHDOG_INTERVAL_SECS: u64 = 30; // Send watchdog ping every 30s
 const RECONNECT_BACKOFF_START_MS: u64 = 500; // First retry delay when the display is gone
 const RECONNECT_BACKOFF_MAX_MS: u64 = 30_000; // Cap between reconnect attempts
@@ -278,6 +281,10 @@ pub struct ClipboardManager {
     reconnect_backoff_ms: u64,
     /// Earliest instant we're allowed to retry; `None` means "try now".
     next_reconnect_at: Option<Instant>,
+    /// Last time the clipboard was demonstrably working (a read that succeeded or
+    /// found it empty), or a reconnect attempt was made while X is unreachable.
+    /// Gates the systemd watchdog so "running but deaf" gets restarted.
+    last_healthy: Instant,
 }
 
 impl ClipboardManager {
@@ -303,6 +310,7 @@ impl ClipboardManager {
             clipboard_failures: 0,
             reconnect_backoff_ms: RECONNECT_BACKOFF_START_MS,
             next_reconnect_at: None,
+            last_healthy: Instant::now(),
         })
     }
 
@@ -336,7 +344,18 @@ impl ClipboardManager {
         .await;
 
         match result {
-            Ok(Ok(Some(clipboard))) => {
+            Ok(Ok(Some(mut clipboard))) => {
+                // arboard caches one X connection per process and never discards
+                // it once its server thread has died (its Drop only resets the
+                // global when it sees exactly 3 owners). So after the X server
+                // drops us, every `Clipboard::new()` returns the same dead
+                // connection and in-process reconnects can never succeed. Exit so
+                // systemd restarts us with fresh library state; a fresh process
+                // that can't reach X backs off in-process, so this can't loop.
+                if let Err(e @ arboard::Error::Unknown { .. }) = clipboard.get_text() {
+                    eprintln!("nocb: X connection is dead and arboard cannot reconnect in-process ({e}); exiting for a clean restart");
+                    std::process::exit(1);
+                }
                 *self.clipboard.write() = Some(clipboard);
                 self.clipboard_failures = 0;
                 self.reconnect_backoff_ms = RECONNECT_BACKOFF_START_MS;
@@ -345,6 +364,8 @@ impl ClipboardManager {
             _ => {
                 // No reachable display (or the probe timed out). Schedule the
                 // next attempt with exponential backoff and keep running.
+                // Waiting for X is a deliberate state, not a hang.
+                self.last_healthy = Instant::now();
                 let backoff = self.reconnect_backoff_ms;
                 self.next_reconnect_at = Some(Instant::now() + Duration::from_millis(backoff));
                 self.reconnect_backoff_ms =
@@ -352,6 +373,10 @@ impl ClipboardManager {
                 eprintln!("nocb: no display reachable; retrying clipboard connection in {backoff}ms");
             }
         }
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.last_healthy.elapsed() < Duration::from_secs(HEALTH_STALE_SECS)
     }
 
     async fn with_clipboard_async<F, T>(&self, f: F) -> Result<T>
@@ -495,7 +520,7 @@ impl ClipboardManager {
         let (tx, mut rx) = mpsc::channel(10);
 
         #[cfg(unix)]
-        let sock_path = std::env::temp_dir().join("nocb.sock");
+        let sock_path = Self::socket_path();
 
         #[cfg(windows)]
         let sock_path = PathBuf::from(r"\\.\pipe\nocb");
@@ -544,8 +569,19 @@ impl ClipboardManager {
                 }
 
                 _ = watchdog_interval.tick() => {
+                    // Only vouch for ourselves when we're actually working, so
+                    // systemd (WatchdogSec) restarts a daemon that is alive but
+                    // deaf — whatever the cause. A poll hung on the lock also
+                    // withholds the ping.
+                    let healthy = manager.lock().await.is_healthy();
                     #[cfg(unix)]
-                    let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
+                    let healthy = healthy && sock_path.exists();
+                    if healthy {
+                        #[cfg(unix)]
+                        let _ = sd_notify::notify(false, &[NotifyState::Watchdog]);
+                    } else {
+                        eprintln!("nocb: unhealthy (clipboard unread for {HEALTH_STALE_SECS}s+ or IPC socket missing); withholding watchdog ping");
+                    }
                 }
 
                 cmd = rx.recv() => {
@@ -609,21 +645,68 @@ impl ClipboardManager {
         true
     }
 
-    async fn ipc_server(tx: mpsc::Sender<Command>, sock_path: PathBuf) -> Result<()> {
-        let _ = std::fs::remove_file(&sock_path);
+    /// IPC socket path. Lives in `$XDG_RUNTIME_DIR` (fallback `/run/user/$UID`)
+    /// because systemd-tmpfiles age-deletes files in `/tmp` after 10 days,
+    /// which silently orphaned a long-running daemon's socket.
+    #[cfg(unix)]
+    pub fn socket_path() -> PathBuf {
+        let uid = unsafe { libc::getuid() };
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|d| d.is_dir())
+            .or_else(|| Some(PathBuf::from(format!("/run/user/{uid}"))).filter(|d| d.is_dir()))
+            .map(|d| d.join("nocb.sock"))
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("nocb-{uid}.sock")))
+    }
 
+    #[cfg(unix)]
+    fn bind_socket(sock_path: &std::path::Path) -> Result<(tokio::net::UnixListener, u64)> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let _ = std::fs::remove_file(sock_path);
+        let listener = tokio::net::UnixListener::bind(sock_path)?;
+        std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o700))?;
+        let ino = std::fs::metadata(sock_path)?.ino();
+        Ok((listener, ino))
+    }
+
+    async fn ipc_server(tx: mpsc::Sender<Command>, sock_path: PathBuf) -> Result<()> {
         #[cfg(unix)]
         {
-            use tokio::net::UnixListener;
+            use std::os::unix::fs::MetadataExt;
 
-            let listener = UnixListener::bind(&sock_path)?;
-
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o700);
-            std::fs::set_permissions(&sock_path, perms)?;
-
+            // Never return: if the socket file disappears or is replaced, or
+            // accept fails, rebind. Otherwise the daemon keeps running but deaf.
+            let mut backoff = Duration::from_millis(500);
             loop {
-                let (mut stream, _addr) = listener.accept().await?;
+                let (listener, ino) = match Self::bind_socket(&sock_path) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("IPC bind {} failed: {e}", sock_path.display());
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
+                };
+                backoff = Duration::from_millis(500);
+                let mut check = tokio::time::interval(Duration::from_secs(30));
+
+                loop {
+                    let mut stream = tokio::select! {
+                        r = listener.accept() => match r {
+                            Ok((stream, _)) => stream,
+                            Err(e) => {
+                                eprintln!("IPC accept failed: {e}, rebinding");
+                                break;
+                            }
+                        },
+                        _ = check.tick() => {
+                            if std::fs::symlink_metadata(&sock_path).map(|m| m.ino()).ok() != Some(ino) {
+                                eprintln!("IPC socket {} vanished, rebinding", sock_path.display());
+                                break;
+                            }
+                            continue;
+                        }
+                    };
 
                 #[cfg(target_os = "linux")]
                 if !Self::verify_peer_uid(&stream) {
@@ -651,6 +734,7 @@ impl ClipboardManager {
                         }
                     }).await;
                 });
+                }
             }
         }
 
@@ -702,12 +786,12 @@ impl ClipboardManager {
         {
             use tokio::net::UnixStream;
 
-            let sock_path = std::env::temp_dir().join("nocb.sock");
+            let sock_path = Self::socket_path();
 
             let mut stream = timeout(Duration::from_secs(2), UnixStream::connect(&sock_path))
                 .await
                 .context("Connection timeout")?
-                .context("Failed to connect to daemon")?;
+                .with_context(|| format!("Failed to connect to daemon at {}", sock_path.display()))?;
 
             let mut msg = Vec::with_capacity(IPC_MAGIC.len() + cmd.len());
             msg.extend_from_slice(IPC_MAGIC);
@@ -738,9 +822,15 @@ impl ClipboardManager {
         Ok(())
     }
 
-    fn is_clipboard_dead(err: &arboard::Error) -> bool {
-        let s = format!("{}", err);
-        s.contains("stopped") || s.contains("handler")
+    /// Only "nothing usable on the clipboard" is benign. Every other arboard
+    /// error means the connection is unhealthy — notably `Unknown` wrapping
+    /// EPIPE once the X server has dropped our connection, which used to be
+    /// mistaken for an empty clipboard and left the daemon deaf for good.
+    pub(crate) fn is_clipboard_dead(err: &arboard::Error) -> bool {
+        !matches!(
+            err,
+            arboard::Error::ContentNotAvailable | arboard::Error::ConversionFailure
+        )
     }
 
     async fn poll_clipboard(&mut self) -> Result<()> {
@@ -760,6 +850,7 @@ impl ClipboardManager {
                             match clipboard.get_text() {
                                 Ok(text) => {
                                     self.clipboard_failures = 0;
+                                    self.last_healthy = Instant::now();
                                     Some(ClipboardContent::Text(text))
                                 }
                                 Err(text_err) => {
@@ -774,6 +865,7 @@ impl ClipboardManager {
                                         match clipboard.get_image() {
                                             Ok(img) => {
                                                 self.clipboard_failures = 0;
+                                                self.last_healthy = Instant::now();
                                                 Some(ClipboardContent::Image(img))
                                             }
                                             Err(img_err) => {
@@ -787,6 +879,7 @@ impl ClipboardManager {
                                                 } else {
                                                     // Normal "no content" case
                                                     self.clipboard_failures = 0;
+                                                    self.last_healthy = Instant::now();
                                                     None
                                                 }
                                             }

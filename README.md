@@ -104,7 +104,7 @@ static_entries = []  # pinned entries
 
 - **database**: `~/.cache/nocb/index.db` - metadata, hashes, timestamps
 - **blobs**: `~/.cache/nocb/blobs/` - compressed text, images
-- **socket**: `/tmp/nocb.sock` - ipc with uid verification
+- **socket**: `$XDG_RUNTIME_DIR/nocb.sock` - ipc with uid verification (self-heals if removed)
 
 ## implementation
 

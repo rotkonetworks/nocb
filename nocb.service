@@ -7,8 +7,11 @@ After=default.target
 StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+Type=notify
 ExecStart=/usr/bin/nocb daemon
+# The daemon pings the watchdog only while it is actually reading the clipboard
+# (or actively waiting for X), so "running but deaf" gets restarted.
+WatchdogSec=90
 Restart=on-failure
 RestartSec=2
 MemoryMax=256M
