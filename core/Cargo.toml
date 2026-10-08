@@ -16,7 +16,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 
 # Clipboard access
-arboard = "3.2"
+arboard = { version = "3.6", features = ["wayland-data-control"] }
 
 # Hashing
 blake3 = "1.5"

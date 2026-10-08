@@ -31,6 +31,7 @@ clipboard is overwritten by the probe.
 | Restart loop, log "exiting for a clean restart … incorrect type received" | A non-connection arboard error classified as a dead connection (regression, fixed in bba61f3) | Only `(os error` / `connection error` count as dead (`is_connection_error`); see the `clipboard_error_tests` tests. |
 | `status=203/EXEC` loop | Binary missing (`target/` wiped, or a symlink to a deleted build) | `cargo build --release -p nocb` and reinstall. |
 | Screenshots missing, text fine | Image read path failing | Check the TARGETS of the owner: `xclip -selection clipboard -t TARGETS -o`. Flameshot offers `application/x-qt-image` + `image/png`. |
+| Wayland session: nothing captured | Compositor lacks data-control, or nocb picked X | Log must say `connected on WAYLAND_DISPLAY=...`. The compositor needs `wlr_data_control_manager_v1` or `ext_data_control` (bspwm1-wl has both). If it says `DISPLAY=`, a native Xorg is still running (`cat /tmp/.X*-lock` → `/proc/PID/comm`). |
 | Alacritty "Failed to set new owner of XCB selection", primary/middle-click clobbered | Another program writing the selection at the same moment. Claude Code's copy-on-select runs `xclip -selection clipboard` **and** `xclip -selection primary` | Find orphaned `xclip` processes (PPID 1) and read `/proc/$PID/environ` for `CLAUDE_CODE_ENTRYPOINT`. Fix: `CLAUDE_CODE_DISABLE_MOUSE=1` or `copyOnSelect=false`. |
 
 ## 3. Tools that worked

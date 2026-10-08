@@ -218,23 +218,77 @@ fn candidate_xauthorities() -> Vec<Option<PathBuf>> {
     auths
 }
 
+/// Whether X display `:N` is served by a real X server (an X11 session) rather
+/// than Xwayland (a Wayland session's compatibility server). Read from the PID
+/// in `/tmp/.XN-lock`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn is_native_x_display(display: &str) -> bool {
+    let Some(num) = display.strip_prefix(':') else { return false };
+    let num = num.split('.').next().unwrap_or(num);
+    let Ok(pid) = std::fs::read_to_string(format!("/tmp/.X{num}-lock")) else { return false };
+    let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", pid.trim())) else { return false };
+    !comm.trim().eq_ignore_ascii_case("xwayland")
+}
+
+/// Wayland compositor sockets in `$XDG_RUNTIME_DIR` that accept a connection
+/// (a crashed compositor leaves a stale file behind), lowest number first —
+/// the session compositor normally owns the lowest one.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn live_wayland_sockets() -> Vec<String> {
+    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let mut sockets: Vec<(u32, String)> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let num: u32 = name.strip_prefix("wayland-")?.parse().ok()?;
+            std::os::unix::net::UnixStream::connect(entry.path()).ok()?;
+            Some((num, name))
+        })
+        .collect();
+    sockets.sort();
+    sockets.into_iter().map(|(_, name)| name).collect()
+}
+
 /// Probe live X displays against candidate auth cookies until `Clipboard::new()`
 /// succeeds — the successful pair *is* the working session, so no separate
 /// `xdpyinfo` check is needed. The winning `(DISPLAY, XAUTHORITY)` is left in
-/// this process's environment for arboard's background X thread to use. On
-/// Wayland we trust the inherited environment.
+/// this process's environment for arboard's background X thread to use.
+///
+/// Session choice is re-discovered on every call, never inherited: the user
+/// service outlives logins, so after switching between the X11 and Wayland
+/// sessions its environment is stale. If a real Xorg server is running we're
+/// in an X11 session and use X (so a nested test compositor can't hijack the
+/// clipboard); otherwise we use a live Wayland compositor via the
+/// data-control protocol, which also sees XWayland apps' copies.
 ///
 /// Returns `None` when no display server is reachable yet (X may simply not be
 /// up); the caller retries with backoff instead of exiting.
 fn connect_clipboard() -> Option<Clipboard> {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        if std::env::var("WAYLAND_DISPLAY")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-        {
-            return Clipboard::new().ok();
+        let x11_session = candidate_displays().iter().any(|d| is_native_x_display(d));
+        if !x11_session {
+            for socket in live_wayland_sockets() {
+                // SAFETY: see the X probe below — single-threaded runtime and the
+                // previous clipboard is already dropped. DISPLAY is cleared so a
+                // failed Wayland init can't silently fall back to X11 inside
+                // arboard and leave us unsure which backend we're on.
+                unsafe {
+                    std::env::set_var("WAYLAND_DISPLAY", &socket);
+                    std::env::remove_var("DISPLAY");
+                }
+                if let Ok(clipboard) = Clipboard::new() {
+                    eprintln!("nocb: clipboard connected on WAYLAND_DISPLAY={socket}");
+                    return Some(clipboard);
+                }
+            }
         }
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
 
         for display in &candidate_displays() {
             for auth in &candidate_xauthorities() {
@@ -352,7 +406,10 @@ impl ClipboardManager {
                 // connection and in-process reconnects can never succeed. Exit so
                 // systemd restarts us with fresh library state; a fresh process
                 // that can't reach X backs off in-process, so this can't loop.
-                if let Err(e) = clipboard.get_text()
+                // Wayland keeps no connection between calls, so it never applies.
+                let on_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+                if !on_wayland
+                    && let Err(e) = clipboard.get_text()
                     && Self::is_connection_error(&e)
                 {
                     eprintln!("nocb: X connection is dead and arboard cannot reconnect in-process ({e}); exiting for a clean restart");
@@ -831,7 +888,13 @@ impl ClipboardManager {
     pub(crate) fn is_connection_error(err: &arboard::Error) -> bool {
         match err {
             arboard::Error::Unknown { description } => {
-                description.contains("(os error") || description.contains("connection error")
+                // X11 (x11rb) connection loss, or the Wayland compositor being
+                // unreachable (wl-clipboard-rs connects fresh on every call).
+                description.contains("(os error")
+                    || description.contains("connection error")
+                    || description.contains("Wayland socket")
+                    || description.contains("Wayland compositor")
+                    || description.contains("no seats")
             }
             _ => false,
         }
@@ -2248,5 +2311,18 @@ mod clipboard_error_tests {
         assert!(!ClipboardManager::is_clipboard_dead(&e));
         assert!(!ClipboardManager::is_clipboard_dead(&Error::ContentNotAvailable));
         assert!(!ClipboardManager::is_clipboard_dead(&Error::ConversionFailure));
+    }
+
+    #[test]
+    fn unreachable_wayland_compositor_is_detected() {
+        // wl-clipboard-rs 0.9 messages for a gone/unusable compositor.
+        for d in [
+            "Couldn't open the provided Wayland socket",
+            "Couldn't connect to the Wayland compositor",
+            "Wayland compositor communication error",
+            "There are no seats",
+        ] {
+            assert!(ClipboardManager::is_connection_error(&unknown(d)), "{d}");
+        }
     }
 }

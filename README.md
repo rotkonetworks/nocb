@@ -130,6 +130,11 @@ the daemon is built to never sit "running but deaf":
 - **socket** — lives in `$XDG_RUNTIME_DIR` (not `/tmp`, which tmpfiles ages out)
   and is rebound automatically if removed
 - **no display** — waits with backoff instead of exiting, so it survives logout/X restarts
+- **x11 or wayland, re-detected on every (re)connect** — a running Xorg means an x11
+  session; otherwise it uses a live wayland compositor via the data-control
+  protocol (wlr or ext), which also sees xwayland apps. the user service outlives
+  logins, so it never trusts an inherited `DISPLAY`/`WAYLAND_DISPLAY`, and a nested
+  test compositor inside an x11 session can't take over the clipboard
 
 quick health check:
 
